@@ -1,17 +1,16 @@
 import express from "express";
-import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json());
 
 const API_SECRET = "ae55e3445f7e585c6295c103f0f5c245fa7275aa4bea8b9bfbffbf6e7ca6e719";
-const PLACE_ID = "109983668079237";
 
 let registeredBots = new Set();
 let scannedServers = new Map();
 let hopStats = [];
-
 let claimedServers = new Map(); // jobId -> { claimedAt, botId }
+
+const CLAIM_TTL_MS = 10 * 1000; // 10 Sekunden
 
 function checkSecret(req, res, next) {
   if (req.headers["x-api-secret"] !== API_SECRET) {
@@ -23,12 +22,12 @@ function checkSecret(req, res, next) {
 app.get("/", (req, res) => {
   res.json({
     status: "online",
-    message: "Brainrot API v1.0",
+    message: "Brainrot API v2.0 (coordination only)",
     endpoints: [
       "POST /scanner-register",
       "GET /scanner-list",
       "POST /add-server",
-      "GET /get-server",
+      "POST /claim-server",
       "POST /record-hop",
       "GET /stats"
     ]
@@ -64,94 +63,26 @@ app.post("/add-server", checkSecret, (req, res) => {
   res.json({ success: true });
 });
 
-app.get("/get-server", checkSecret, async (req, res) => {
-  try {
-    const currentJob = req.query.current;
-    const botId = req.query.bot || "unknown";
+app.post("/claim-server", checkSecret, (req, res) => {
+  const { jobId, botId } = req.body || {};
+  if (!jobId || !botId) return res.status(400).json({ error: "Missing jobId or botId" });
 
-    const now = Date.now();
-    const CLAIM_TTL_MS = 10 * 1000; // 10 Sekunden Claim-Lifetime
+  const now = Date.now();
 
-    for (const [jobId, info] of claimedServers.entries()) {
-      if (now - info.claimedAt > CLAIM_TTL_MS) {
-        claimedServers.delete(jobId);
-      }
+  for (const [jid, info] of claimedServers.entries()) {
+    if (now - info.claimedAt > CLAIM_TTL_MS) {
+      claimedServers.delete(jid);
     }
-
-    const MAX_PAGES = 5;       // bis zu 5 Seiten à 100 = 500 Server
-    const LIMIT_PER_PAGE = 100;
-    const MIN_PLAYERS = 4;
-    const MAX_PLAYERS = 7;
-
-    let allServers = [];
-    let cursor = "";
-    let pages = 0;
-
-    while (pages < MAX_PAGES) {
-      pages++;
-
-      let url = `https://games.roblox.com/v1/games/${PLACE_ID}/servers/Public?sortOrder=Desc&limit=${LIMIT_PER_PAGE}`;
-      if (cursor) url += `&cursor=${cursor}`;
-
-      const response = await fetch(url);
-      const data = await response.json();
-
-      if (!data.data || data.data.length === 0) break;
-
-      allServers = allServers.concat(data.data);
-
-      if (!data.nextPageCursor) break;
-      cursor = data.nextPageCursor;
-    }
-
-    if (allServers.length === 0) {
-      console.log("[API] /get-server: keine Server von Roblox erhalten");
-      return res.status(404).json({ error: "No servers from Roblox" });
-    }
-
-    const candidates = allServers.filter(
-      (s) =>
-        s.id &&
-        s.id !== currentJob &&
-        !claimedServers.has(s.id)
-    );
-
-    const good = candidates.filter(
-      (s) =>
-        typeof s.playing === "number" &&
-        typeof s.maxPlayers === "number" &&
-        s.playing >= MIN_PLAYERS &&
-        s.playing <= MAX_PLAYERS &&
-        s.playing < s.maxPlayers
-    );
-
-    let pool;
-
-    if (good.length > 0) {
-      pool = good;
-    } else if (candidates.length > 0) {
-      console.log("[API] /get-server: keine guten Server, nehme irgendeinen unclaimed");
-      pool = candidates;
-    } else {
-      console.log("[API] /get-server: alle Server geclaimed, ignoriere Claims als Fallback");
-      pool = allServers.filter((s) => s.id && s.id !== currentJob);
-      if (pool.length === 0) {
-        return res.status(404).json({ error: "No available servers at all" });
-      }
-    }
-
-    const chosen = pool[Math.floor(Math.random() * pool.length)];
-    claimedServers.set(chosen.id, { claimedAt: now, botId });
-
-    console.log(
-      `[API] /get-server -> ${chosen.id} (${chosen.playing}/${chosen.maxPlayers}) für ${botId}`
-    );
-
-    res.json({ job_id: chosen.id });
-  } catch (err) {
-    console.error("Roblox API error in /get-server:", err);
-    res.status(500).json({ error: "Roblox API error" });
   }
+
+  const existing = claimedServers.get(jobId);
+  if (existing && now - existing.claimedAt <= CLAIM_TTL_MS) {
+    return res.json({ success: false, reason: "claimed" });
+  }
+
+  claimedServers.set(jobId, { claimedAt: now, botId });
+  console.log(`Server ${jobId} claimed by ${botId}`);
+  res.json({ success: true });
 });
 
 app.post("/record-hop", checkSecret, (req, res) => {
@@ -169,7 +100,8 @@ app.get("/stats", (req, res) => {
     total_bots: registeredBots.size,
     total_servers_scanned: scannedServers.size,
     total_hops: hopStats.length,
-    total_brainrots_found: totalBrainrots
+    total_brainrots_found: totalBrainrots,
+    current_claims: Array.from(claimedServers.entries())
   });
 });
 
