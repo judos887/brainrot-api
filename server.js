@@ -11,6 +11,9 @@ let registeredBots = new Set();
 let scannedServers = new Map();
 let hopStats = [];
 
+let claimedServers = new Map(); // jobId -> { claimedAt, botId }
+const CLAIM_TTL_MS = 60 * 1000; // 60 Sekunden
+
 function checkSecret(req, res, next) {
   if (req.headers["x-api-secret"] !== API_SECRET) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -56,13 +59,22 @@ app.post("/add-server", checkSecret, (req, res) => {
     scannedAt: Date.now()
   });
 
-  console.log(`Server ${jobId} scanned with ${brainrots?.length || 0} brainrots`);
+  console.log(`Server ${jobId} scanned with ${(brainrots && brainrots.length) || 0} brainrots`);
   res.json({ success: true });
 });
 
 app.get("/get-server", checkSecret, async (req, res) => {
   try {
     const currentJob = req.query.current;
+    const botId = req.query.bot || "unknown";
+
+    const now = Date.now();
+    for (const [jobId, info] of claimedServers.entries()) {
+      if (now - info.claimedAt > CLAIM_TTL_MS) {
+        claimedServers.delete(jobId);
+      }
+    }
+
     const response = await fetch(
       `https://games.roblox.com/v1/games/${PLACE_ID}/servers/Public?sortOrder=Desc&limit=100`
     );
@@ -73,16 +85,29 @@ app.get("/get-server", checkSecret, async (req, res) => {
     }
 
     const good = data.data.filter(
-      (s) => s.id !== currentJob && s.playing >= 4 && s.playing <= 7
+      (s) =>
+        s.id !== currentJob &&
+        s.playing >= 4 &&
+        s.playing <= 7 &&
+        !claimedServers.has(s.id)
     );
 
-    const pool = good.length > 0 ? good : data.data.filter((s) => s.id !== currentJob);
+    const pool =
+      good.length > 0
+        ? good
+        : data.data.filter((s) => s.id !== currentJob && !claimedServers.has(s.id));
+
     if (pool.length === 0) {
-      return res.status(404).json({ error: "No other servers" });
+      return res.status(404).json({ error: "No unclaimed servers" });
     }
 
     const chosen = pool[Math.floor(Math.random() * pool.length)];
-    console.log(`Sending server ${chosen.id} (${chosen.playing}/8)`);
+    claimedServers.set(chosen.id, { claimedAt: now, botId });
+
+    console.log(
+      `Sending server ${chosen.id} to ${botId} (${chosen.playing}/${chosen.maxPlayers})`
+    );
+
     res.json({ job_id: chosen.id });
   } catch (err) {
     console.error("Roblox API error:", err);
@@ -98,7 +123,7 @@ app.post("/record-hop", checkSecret, (req, res) => {
 
 app.get("/stats", (req, res) => {
   const totalBrainrots = Array.from(scannedServers.values()).reduce(
-    (sum, s) => sum + (s.brainrots?.length || 0),
+    (sum, s) => sum + ((s.brainrots && s.brainrots.length) || 0),
     0
   );
   res.json({
