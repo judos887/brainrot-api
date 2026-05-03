@@ -1,15 +1,15 @@
 import express from "express";
+import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json());
 
+// === CONFIG ===
 const API_SECRET = "ae55e3445f7e585c6295c103f0f5c245fa7275aa4bea8b9bfbffbf6e7ca6e719";
+// dein PlaceId (das Spiel, das die Bots scannen sollen)
+const PLACE_ID = process.env.PLACE_ID || "109983668079237";
 
-let registeredBots = new Set();
-let scannedServers = new Map(); // jobId -> {players, value, lastSeen, assignedTo?}
-let hopStats       = [];
-let serverQueue    = []; // Array von jobIds, die verteilt werden sollen
-
+// Helpers
 function checkSecret(req, res, next) {
   if (req.headers["x-api-secret"] !== API_SECRET) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -17,13 +17,18 @@ function checkSecret(req, res, next) {
   next();
 }
 
+// einfache Stats
+let hops = [];
+let addServerEvents = [];
+
+// ==============================
+// ROTER ENDPOINT: HEALTHCHECK
+// ==============================
 app.get("/", (req, res) => {
   res.json({
     status: "online",
-    message: "Brainrot API v3.0 (Server pool)",
+    placeId: PLACE_ID,
     endpoints: [
-      "POST /scanner-register",
-      "GET  /scanner-list",
       "POST /add-server",
       "GET  /get-server",
       "POST /record-hop",
@@ -32,107 +37,158 @@ app.get("/", (req, res) => {
   });
 });
 
-app.post("/scanner-register", checkSecret, (req, res) => {
-  const { username } = req.body || {};
-  if (!username) return res.status(400).json({ error: "No username" });
-  registeredBots.add(username);
-  console.log("Bot registered:", username);
-  res.json({ success: true, total_bots: registeredBots.size });
-});
-
-app.get("/scanner-list", checkSecret, (req, res) => {
-  res.json({ usernames: Array.from(registeredBots) });
-});
-
-// Bots schicken hier: jobId, players, brainrots (Liste), timestamp
+// ==============================
+// /add-server  -> nur Logging
+// ==============================
 app.post("/add-server", checkSecret, (req, res) => {
   const { jobId, players, brainrots, timestamp } = req.body || {};
-  if (!jobId) return res.status(400).json({ error: "No jobId" });
+  if (!jobId) {
+    return res.status(400).json({ error: "No jobId" });
+  }
 
-  const now = Date.now();
-  const value = Array.isArray(brainrots)
-    ? brainrots.reduce((acc, b) => acc + (b.value || 0), 0)
+  const totalValue = Array.isArray(brainrots)
+    ? brainrots.reduce((s, b) => s + (b.value || 0), 0)
     : 0;
 
-  scannedServers.set(jobId, {
+  addServerEvents.push({
+    jobId,
     players: players || 0,
-    value: value,
-    lastSeen: timestamp || now,
-    assignedTo: null,
-    assignedAt: null
+    totalValue,
+    brainrots: brainrots || [],
+    timestamp: timestamp || Date.now()
   });
-
-  // Server in die Queue pushen (wenn noch nicht drin)
-  if (!serverQueue.includes(jobId)) {
-    serverQueue.push(jobId);
-  }
 
   console.log(
-    `Server ${jobId} gespeichert: players=${players || 0}, value=${value}`
+    `[ADD-SERVER] jobId=${jobId} players=${players || 0} totalValue=${totalValue}`
   );
   res.json({ success: true });
 });
 
-// Bots fragen hier: gib mir eine JobId > API gibt Server aus der gespeicherten Liste
-app.get("/get-server", checkSecret, (req, res) => {
-  const botId = req.query.bot || "unknown";
-  const now   = Date.now();
-  const ASSIGN_TTL = 60 * 1000; // 1 Minute
+// ==============================
+// Roblox Serverliste holen
+// ==============================
+async function fetchRobloxServers() {
+  let servers = [];
+  let cursor = "";
+  const MAX_PAGES = 5;
 
-  // alte Assignments verfallen lassen
-  for (const [jobId, info] of scannedServers.entries()) {
-    if (info.assignedAt && now - info.assignedAt > ASSIGN_TTL) {
-      info.assignedTo = null;
-      info.assignedAt = null;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    let url = `https://games.roblox.com/v1/games/${PLACE_ID}/servers/Public?sortOrder=Desc&limit=100`;
+    if (cursor) url += `&cursor=${cursor}`;
+
+    const resp = await fetch(url, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Viode-Hopper/1.0",
+        "Accept": "application/json"
+      }
+    });
+
+    if (!resp.ok) {
+      console.error("[GET-SERVER] Roblox API HTTP", resp.status);
+      break;
     }
+
+    const data = await resp.json();
+    if (!data || !Array.isArray(data.data) || data.data.length === 0) {
+      console.log("[GET-SERVER] Roblox API: keine data.data");
+      break;
+    }
+
+    servers = servers.concat(data.data);
+
+    if (!data.nextPageCursor) break;
+    cursor = data.nextPageCursor;
   }
 
-  // aus Queue nach "geeignetem" Server suchen
-  while (serverQueue.length > 0) {
-    const jobId = serverQueue.shift();
-    const info  = scannedServers.get(jobId);
-    if (!info) continue;
+  return servers;
+}
 
-    // falls bereits zugewiesen & noch nicht abgelaufen -> skip
-    if (info.assignedTo && now - (info.assignedAt || 0) <= ASSIGN_TTL) {
-      continue;
+// ==============================
+// /get-server  -> neuen Server wählen
+// ==============================
+const ASSIGNED = new Map(); // jobId -> { assignedAt, botId }
+const ASSIGN_TTL_MS = 60 * 1000;
+
+app.get("/get-server", checkSecret, async (req, res) => {
+  try {
+    const now = Date.now();
+    const botId = req.query.bot || "unknown";
+    const currentJobId = req.query.current || null;
+
+    // alte Assignments aufräumen
+    for (const [jobId, info] of ASSIGNED.entries()) {
+      if (now - info.assignedAt > ASSIGN_TTL_MS) {
+        ASSIGNED.delete(jobId);
+      }
     }
 
-    // einfachen Qualitätsfilter: mind. 4 Spieler, mind. etwas Value
-    if (info.players >= 1 && info.value > 0) {
-      info.assignedTo = botId;
-      info.assignedAt = now;
-      console.log(`GET-SERVER -> jobId=${jobId} to bot=${botId}`);
-      return res.json({ job_id: jobId });
+    const servers = await fetchRobloxServers();
+    if (!servers || servers.length === 0) {
+      console.log("[GET-SERVER] keine Server von Roblox erhalten");
+      return res.status(404).json({ error = "No servers from Roblox" });
     }
+
+    // Filter: nicht current, nicht voll, nicht assigned
+    const candidates = servers.filter((s) => {
+      if (!s.id) return false;
+      if (s.id === currentJobId) return false;
+      if (typeof s.playing !== "number" || typeof s.maxPlayers !== "number")
+        return false;
+      if (s.playing >= s.maxPlayers) return false;
+      const info = ASSIGNED.get(s.id);
+      if (info && now - info.assignedAt <= ASSIGN_TTL_MS) return false;
+      return true;
+    });
+
+    if (candidates.length === 0) {
+      console.log("[GET-SERVER] keine passenden Kandidaten (alle assigned/voll)");
+      return res.status(404).json({ error: "No suitable servers" });
+    }
+
+    // leichte Priorität: 4–7 Spieler bevorzugen
+    const good = candidates.filter(
+      (s) => s.playing >= 4 && s.playing <= 7
+    );
+    const pool = good.length > 0 ? good : candidates;
+
+    const chosen = pool[Math.floor(Math.random() * pool.length)];
+    ASSIGNED.set(chosen.id, { assignedAt: now, botId });
+
+    console.log(
+      `[GET-SERVER] -> jobId=${chosen.id} (${chosen.playing}/${chosen.maxPlayers}) to bot=${botId}`
+    );
+
+    res.json({ job_id: chosen.id });
+  } catch (err) {
+    console.error("[GET-SERVER] Exception:", err);
+    res.status(500).json({ error: "Roblox API error" });
   }
-
-  console.log("GET-SERVER: keine passenden Einträge in Queue");
-  return res.status(404).json({ error: "No queued servers" });
 });
 
+// ==============================
+// /record-hop -> nur Stats
+// ==============================
 app.post("/record-hop", checkSecret, (req, res) => {
-  hopStats.push({ ...req.body, timestamp: Date.now() });
-  console.log("Hop recorded:", req.body);
+  hops.push({ ...req.body, timestamp: Date.now() });
+  console.log("[HOP]", req.body);
   res.json({ success: true });
 });
 
+// ==============================
+// /stats
+// ==============================
 app.get("/stats", (req, res) => {
-  const totalBrainrots = Array.from(scannedServers.values()).reduce(
-    (sum, s) => sum + (s.value || 0),
-    0
-  );
-
   res.json({
-    total_bots: registeredBots.size,
-    total_servers_scanned: scannedServers.size,
-    total_hops: hopStats.length,
-    total_brainrots_value: totalBrainrots,
-    queued_servers: serverQueue.length
+    addServerEvents: addServerEvents.length,
+    hops: hops.length,
+    lastAddServer: addServerEvents[addServerEvents.length - 1] || null,
+    lastHop: hops[hops.length - 1] || null
   });
 });
 
+// ==============================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`API running on port ${PORT}`);
+  console.log(`API running on port ${PORT}, PLACE_ID=${PLACE_ID}`);
 });
